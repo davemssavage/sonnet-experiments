@@ -35,10 +35,13 @@ class TokenDataSource(object):
 
     self._vocab_dict = {}
     self._inv_vocab_dict = {}
+    self.count = {}
 
     token_list = reading_function(vocab_data_file)
+
     token_list = [tok for (tok, _) in collections.Counter(token_list).most_common(vocabulary_size - 1)]
     self.vocab_size = 0
+
     for token in self.DEFAULT_START_TOKENS + token_list:
       if token not in self._vocab_dict:
         self._vocab_dict[token] = self.vocab_size
@@ -51,10 +54,13 @@ class TokenDataSource(object):
 
   def tokenize(self, token_list):
     """Produces the list of integer indices corresponding to a token list."""
-    return [
-        self._vocab_dict.get(token, self._vocab_dict[self.UNK])
-        for token in token_list
-    ]
+    def token_and_count(token):
+      encoded = self._vocab_dict.get(token, self._vocab_dict[self.UNK])
+      count = self.count.get(encoded, 0)
+      self.count[encoded] = count+1
+      return encoded
+
+    return [token_and_count(token) for token in token_list]
 
   def decode(self, token_list):
     """Produces a human-readable representation of the token list."""
@@ -91,6 +97,7 @@ class SkipGramDataset(snt.AbstractModule):
     self._vocab_size = self._data_source.vocab_size
     self._flat_data = self._data_source.flat_data
     self._n_flat_elements = self._data_source.num_tokens
+    self._count = self._data_source.count
 
     self._num_batches = self._n_flat_elements // (self._skip_window * batch_size)
     self._reset_head_indices()
@@ -132,6 +139,7 @@ class SkipGramDataset(snt.AbstractModule):
 
     target = np.reshape(target, (self._batch_size*self._skip_window*2))
 
+    #stats = np.array([np.int32(self._count[t]) for t in target])
     stats = np.zeros(len(target),dtype=np.int32)
 
     self._head_indices = np.mod(
@@ -148,20 +156,30 @@ class SkipGramDataset(snt.AbstractModule):
     enqueue_op = q.enqueue([obs, target, stats])
     obs, target, stats = q.dequeue()
     tf.train.add_queue_runner(tf.train.QueueRunner(q, [enqueue_op]))
-    #return SequenceDataOpsNoMask(obs, target)
-    #return SequenceDataOpsNoMask(obs, (target, stats))
     return SequenceDataOpsNoMask(obs, tf.stack([target, stats], axis=1))
+
+  def sample(self,sample_size, sample_window):
+    """
+    Args:
+      sample_size: Random set of words to evaluate similarity on.
+      sample_window: Only pick dev samples in the head of the distribution.
+    """
+    sample_values = np.random.choice(sample_window, sample_size, replace=False)
+    return tf.constant(sample_values, dtype=tf.int32)
+
+
+  def decode(self, token_list):
+      return self._data_source.decode(token_list)
 
   def to_human_readable(self,
                         data,
                         label_batch_entries=True,
                         indices=None,
                         sep="\n"):
-    """Returns a human-readable version of a one-hot encoding of words.
+    """Returns a human-readable version of encoding of words.
 
     Args:
-      data: A tuple with (obs, target). `obs` is a numpy array with one-hot
-          encoding of words.
+      data: A tuple with (obs, target). `obs` is a numpy array with encoding of words.
       label_batch_entries: bool. Whether to add numerical label before each
           batch element in the output string.
       indices: List of int or None. Used to select a subset of minibatch indices
@@ -223,14 +241,14 @@ class Word2VecModel(snt.AbstractModule):
           shape=[self._vocabulary_size],
           initializer=tf.zeros_initializer())
 
-    embed = snt.Embed(self._vocabulary_size,embed_dim=self._embedding_size)
-    self._embed = embed(inputs)
+    self._embed = snt.Embed(self._vocabulary_size,embed_dim=self._embedding_size)
+    self._embedded = self._embed(inputs)
 
-    norm = tf.sqrt(tf.reduce_sum(tf.square(embed.embeddings), 1, keep_dims=True))
+    norm = tf.sqrt(tf.reduce_sum(tf.square(self._embed.embeddings), 1, keep_dims=True))
 
-    self._normalized_embeddings = embed.embeddings / norm
+    self._normalized_embeddings = self._embed.embeddings / norm
 
-    return self._embed
+    return self._embedded
 
   def cost(self, logits, target):
       return tf.reduce_mean(
@@ -242,16 +260,32 @@ class Word2VecModel(snt.AbstractModule):
                          num_sampled=self._num_sampled,
                          num_classes=self._vocabulary_size))
 
+  def similar_to(self, ids, top_k):
+    similarity = self._cosine_similarity(self._lookup(ids))
+    return tf.nn.top_k(similarity, top_k, name="similar")
+
+  def _lookup(self, ids):
+    return tf.nn.embedding_lookup(self._normalized_embeddings, ids)
+
+  def _cosine_similarity(self, embeddings):
+    return tf.matmul(embeddings, self._normalized_embeddings, transpose_b=True, name="cosine_similarity")
+
 batch_size = 128
 embedding_size = 128  # Dimension of the embedding vector.
 skip_window = 1       # How many words to consider left and right.
+sample_size=16
+sample_window=100
+top_k = 8
 
-dataset = SkipGramDataset("/data/tiny-shakespeare.txt", batch_size=batch_size)
+#dataset = SkipGramDataset("/data/tiny-shakespeare.txt", batch_size=batch_size)
+dataset = SkipGramDataset("/data/text8", batch_size=batch_size)
 word2vec = Word2VecModel(dataset.vocab_size, embedding_size)
 
 input_sequence, target_sequence = dataset()
-output_sequence_logits = word2vec(input_sequence)  # pylint: disable=not-callable
+sample_dataset = dataset.sample(sample_size, sample_window)
+output_sequence_logits = word2vec(input_sequence)
 loss = word2vec.cost(output_sequence_logits, target_sequence)
+similar_words = word2vec.similar_to(sample_dataset, top_k+1)
 
 # Construct the SGD optimizer using a learning rate of 1.0.
 optimizer = tf.train.GradientDescentOptimizer(1.0).minimize(loss)
@@ -268,7 +302,7 @@ def learn():
 
     with sess.as_default():
       try:
-        num_steps = 10001
+        num_steps = 100001
         average_loss = 0
 
         for step in xrange(num_steps):
@@ -283,6 +317,16 @@ def learn():
               # The average loss is an estimate of the loss over the last 2000 batches.
               print('Average loss at step ', step, ': ', average_loss)
               average_loss = 0
+
+          # Note that this is expensive (~20% slowdown if computed every 500 steps)
+          if step % 10000 == 0:
+            if step > 0:
+              (_, indices) = sess.run(similar_words)
+
+              for i in xrange(sample_size):
+                sample = dataset.decode([sample_dataset.eval()[i]])
+                similar = dataset.decode(indices[i,1:])
+                print("%s -> %s" % (sample, similar))
 
       except tf.errors.OutOfRangeError:
         print('Done')
