@@ -120,43 +120,41 @@ class SkipGramDataset(snt.AbstractModule):
     """
     batch_indices = np.mod(
         np.array([
-            np.arange(head_index - self._skip_window, head_index + self._skip_window + 1) for
-            head_index in self._head_indices]),
+                   np.arange(head_index - self._skip_window, head_index + self._skip_window + 1)
+                   for head_index in self._head_indices
+                 ]),
         self._n_flat_elements)
 
 
     obs = np.array([
-      [self._flat_data[indices[i]] for i in range(0, skip_window) + range(skip_window+1, 1+skip_window*2)]
+      self._flat_data[indices[i]]
+      for i in range(0, self._skip_window) + range(self._skip_window+1, 1+self._skip_window*2)
       for indices in batch_indices
     ])
-
-    obs = np.reshape(obs, (self._batch_size*self._skip_window*2))
 
     target = np.array([
-      [self._flat_data[indices[self._skip_window]] for i in range(self._skip_window * 2)]
+      self._flat_data[indices[i]]
+      for i in range(self._skip_window * 2)
       for indices in batch_indices
     ])
-
-    target = np.reshape(target, (self._batch_size*self._skip_window*2))
-
-    #stats = np.array([np.int32(self._count[t]) for t in target])
-    stats = np.zeros(len(target),dtype=np.int32)
 
     self._head_indices = np.mod(
         self._head_indices + 1, self._n_flat_elements)
 
-    return obs, target, stats
+    return obs, target
 
   def _build(self):
     """Returns a tuple containing observation and target tensors."""
     q = tf.FIFOQueue(
-        self._queue_capacity, [tf.int32, tf.int32, tf.int32],
-        shapes=[[self._skip_window*2*self._batch_size]]*3)
-    obs, target, stats = tf.py_func(self._get_batch, [], [tf.int32, tf.int32, tf.int32])
-    enqueue_op = q.enqueue([obs, target, stats])
-    obs, target, stats = q.dequeue()
+        self._queue_capacity, [tf.int32, tf.int32],
+        shapes=[[self._skip_window*2*self._batch_size]]*2)
+    obs, target = tf.py_func(self._get_batch, [], [tf.int32, tf.int32])
+    enqueue_op = q.enqueue([obs, target])
+    obs, target = q.dequeue()
+    # needed for nce loss - expects 2d array, TODO move somewhere closer
+    target = tf.reshape(target, (self._skip_window*2*self._batch_size, 1))
     tf.train.add_queue_runner(tf.train.QueueRunner(q, [enqueue_op]))
-    return SequenceDataOpsNoMask(obs, tf.stack([target, stats], axis=1))
+    return SequenceDataOpsNoMask(obs, target)
 
   def sample(self,sample_size, sample_window):
     """
@@ -256,7 +254,7 @@ class Word2VecModel(snt.AbstractModule):
                          biases=self._nce_biases,
                          labels=target,
                          inputs=logits,
-                         num_true=2,
+                         num_true=1,
                          num_sampled=self._num_sampled,
                          num_classes=self._vocabulary_size))
 
