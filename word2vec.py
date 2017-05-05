@@ -227,6 +227,12 @@ class Word2VecModel(snt.AbstractModule):
 
     Returns: .
     """
+    self._embeddings = tf.get_variable(
+          "embeddings",
+          dtype=tf.float32,
+          shape=[self._vocabulary_size, self._embedding_size],
+          initializer=tf.random_uniform_initializer(-1.0, 1.0))
+
     self._nce_weights = tf.get_variable(
           "nce_weights",
           dtype=tf.float32,
@@ -239,14 +245,13 @@ class Word2VecModel(snt.AbstractModule):
           shape=[self._vocabulary_size],
           initializer=tf.zeros_initializer())
 
-    self._embed = snt.Embed(self._vocabulary_size,embed_dim=self._embedding_size)
-    self._embedded = self._embed(inputs)
+    self._embed = tf.nn.embedding_lookup(self._embeddings, inputs)
 
-    norm = tf.sqrt(tf.reduce_sum(tf.square(self._embed.embeddings), 1, keep_dims=True))
+    norm = tf.sqrt(tf.reduce_sum(tf.square(self._embeddings), 1, keep_dims=True))
 
-    self._normalized_embeddings = self._embed.embeddings / norm
+    self._normalized_embeddings = self._embeddings / norm
 
-    return self._embedded
+    return self._embed
 
   def cost(self, logits, target):
       return tf.reduce_mean(
@@ -258,12 +263,9 @@ class Word2VecModel(snt.AbstractModule):
                          num_sampled=self._num_sampled,
                          num_classes=self._vocabulary_size))
 
-  def similar_to(self, ids, top_k):
-    similarity = self._cosine_similarity(self._lookup(ids))
-    return tf.nn.top_k(similarity, top_k, name="similar")
-
-  def _lookup(self, ids):
-    return tf.nn.embedding_lookup(self._normalized_embeddings, ids)
+  def similarity(self, ids):
+    embedded = tf.nn.embedding_lookup(self._normalized_embeddings, ids)
+    return self._cosine_similarity(embedded)
 
   def _cosine_similarity(self, embeddings):
     return tf.matmul(embeddings, self._normalized_embeddings, transpose_b=True, name="cosine_similarity")
@@ -281,9 +283,10 @@ word2vec = Word2VecModel(dataset.vocab_size, embedding_size)
 
 input_sequence, target_sequence = dataset()
 sample_dataset = dataset.sample(sample_size, sample_window)
+
 output_sequence_logits = word2vec(input_sequence)
 loss = word2vec.cost(output_sequence_logits, target_sequence)
-similar_words = word2vec.similar_to(sample_dataset, top_k+1)
+similarity = word2vec.similarity(sample_dataset)
 
 # Construct the SGD optimizer using a learning rate of 1.0.
 optimizer = tf.train.GradientDescentOptimizer(1.0).minimize(loss)
@@ -319,11 +322,12 @@ def learn():
           # Note that this is expensive (~20% slowdown if computed every 500 steps)
           if step % 10000 == 0:
             if step > 0:
-              (_, indices) = sess.run(similar_words)
+              sim = sess.run(similarity)
 
               for i in xrange(sample_size):
                 sample = dataset.decode([sample_dataset.eval()[i]])
-                similar = dataset.decode(indices[i,1:])
+                nearest = (-sim[i, :]).argsort()[1:top_k + 1]
+                similar = dataset.decode(nearest)
                 print("%s -> %s" % (sample, similar))
 
       except tf.errors.OutOfRangeError:
