@@ -73,7 +73,7 @@ SequenceDataOpsNoMask = collections.namedtuple("SequenceDataOpsNoMask",
 class SkipGramDataset(snt.AbstractModule):
   """Skip gram text sequence data."""
 
-  def __init__(self, data_file, vocab_data_file=None, skip_window=1, batch_size=1,
+  def __init__(self, data_file, vocab_data_file=None, skip_window=1, batch_size=1, num_skips=1,
                name="skip_gram_text_dataset"):
     """Initializes a SkipGramDataset sequence data object.
 
@@ -87,10 +87,14 @@ class SkipGramDataset(snt.AbstractModule):
 
     # Generate vocab from train set.
 
+    assert batch_size % num_skips == 0
+    assert num_skips <= 2 * skip_window
+
     self._data_file = gfile.Open(data_file)
     self._vocab_data_file = gfile.Open(vocab_data_file or data_file)
     self._skip_window = skip_window
     self._batch_size = batch_size
+    self._num_skips = num_skips
 
     self._data_source = TokenDataSource(data_file=self._data_file, vocab_data_file=self._vocab_data_file)
 
@@ -109,34 +113,27 @@ class SkipGramDataset(snt.AbstractModule):
     return self._vocab_size
 
   def _reset_head_indices(self):
-    self._head_indices = np.arange(self._batch_size, dtype=np.int32)
+    self._head_indices = np.arange(self._batch_size // self._num_skips, dtype=np.int32)
 
   def _get_batch(self):
     """Returns a batch of skip grams.
 
     Returns:
-      obs: np.int32 array of size [Time, Batch]
-      target: np.int32 array of size [Time, Batch]
+      obs: np.int32 array of size [Batch]
+      target: np.int32 array of size [Batch]
     """
-    batch_indices = np.mod(
-        np.array([
-                   np.arange(head_index - self._skip_window, head_index + self._skip_window + 1)
-                   for head_index in self._head_indices
-                 ]),
-        self._n_flat_elements)
+    skip_targets = np.array(range(--self._skip_window, 0) + range(1, self._skip_window+1))
 
+    def select_targets(i): # TODO add probability based on frequency of words
+      return np.random.choice(skip_targets, self._num_skips, replace=False)
 
-    obs = np.array([
-      self._flat_data[indices[i]]
-      for i in range(0, self._skip_window) + range(self._skip_window+1, 1+self._skip_window*2)
-      for indices in batch_indices
-    ])
+    obs = np.array([self._flat_data[i] for _ in range(self._num_skips) for i in self._head_indices], dtype=np.int32)
 
-    target = np.array([
-      self._flat_data[indices[i]]
-      for i in range(self._skip_window * 2)
-      for indices in batch_indices
-    ])
+    target_indices = np.mod(
+      [i + target for i in self._head_indices for target in select_targets(i)]
+    , self._n_flat_elements)
+
+    target = np.array([self._flat_data[i] for i in target_indices], dtype=np.int32)
 
     self._head_indices = np.mod(
         self._head_indices + 1, self._n_flat_elements)
@@ -147,12 +144,12 @@ class SkipGramDataset(snt.AbstractModule):
     """Returns a tuple containing observation and target tensors."""
     q = tf.FIFOQueue(
         self._queue_capacity, [tf.int32, tf.int32],
-        shapes=[[self._skip_window*2*self._batch_size]]*2)
+        shapes=[[self._batch_size]]*2)
     obs, target = tf.py_func(self._get_batch, [], [tf.int32, tf.int32])
     enqueue_op = q.enqueue([obs, target])
     obs, target = q.dequeue()
     # needed for nce loss - expects 2d array, TODO move somewhere closer
-    target = tf.reshape(target, (self._skip_window*2*self._batch_size, 1))
+    target = tf.reshape(target, (self._batch_size, 1))
     tf.train.add_queue_runner(tf.train.QueueRunner(q, [enqueue_op]))
     return SequenceDataOpsNoMask(obs, target)
 
@@ -272,7 +269,7 @@ class Word2VecModel(snt.AbstractModule):
 
 batch_size = 128
 embedding_size = 128  # Dimension of the embedding vector.
-skip_window = 1       # How many words to consider left and right.
+skip_window = 2       # How many words to consider left and right.
 sample_size=16
 sample_window=100
 top_k = 8
